@@ -30,4 +30,4 @@ Following improvements to implement are:
 > The implemented macro in this repository is a working macro for shiny hunting in Pokemon Legends ZA wildzone 5.
 
 ## License
-Code is published under GPU v3.0 license.
+[Code is published under GPU v3.0 license.](license.md)
