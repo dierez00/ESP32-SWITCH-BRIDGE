@@ -1,6 +1,12 @@
 # ESP32 as a working Nintendo Switch Controller/Joycon
 Let an ESP32 connect as a Pro Controller or Joycon to a Nintendo Switch and run custom Macros.
 
+Pre-built firmware file will be provided soon.
+
+## Setup in VS Code
+Project is been programmed with PlatformIO in VS Code.
+Necessary files are all included, to build yourself.
+
 > [!NOTE]
 > Code has been tested on a ESP32 DevKit v1.
 
