@@ -37,6 +37,17 @@ enum ControllerType {
     CT_JOYCON_R = 0x02
 };
 
+// Counters are written from the Bluetooth tasks and copied for diagnostics.
+struct SwitchLinkStats {
+    uint32_t pmModeChanges;
+    uint8_t lastPmMode;
+    uint32_t reportTxFailures;
+    uint32_t subcommands;
+    uint32_t unknownSubcommands;
+    uint8_t lastUnknownSubcommand;
+    uint32_t reconnectAttempts;
+    uint32_t policyApplied;
+};
 
 class SwitchController {
 public:
@@ -44,17 +55,23 @@ public:
     bool begin(ControllerType type = CT_PRO_CONTROLLER);
     bool isConnected();
     bool isHandshakeComplete();
-    
+
+    // Call from loop(): prints deferred Bluetooth events and reconnects to
+    // the known Switch when the HID link drops.
+    void service(uint32_t now);
+    SwitchLinkStats stats();
+
     void setButtons(uint8_t b1, uint8_t b2, uint8_t b3);
     void setSticks(uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry);
     void sendReport();
 
 private:
     static void hid_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param);
+    static void gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param);
     static ControllerType _activeType;
-    static bool _connected;
-    static bool _handshake_complete;
-    uint8_t _b[3] = {0,0,0}, _s[4] = {128,128,128,128}, _timer = 0;
+
+    uint32_t _lastReconnectMs = 0;
+    uint32_t _reconnectDelayMs = 0;
 };
 
 #endif

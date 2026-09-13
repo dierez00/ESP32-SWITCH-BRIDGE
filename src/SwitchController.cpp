@@ -1,8 +1,10 @@
 #include "SwitchController.h"
-#include "nvs_flash.h"
 
-// Current instance
-static SwitchController* activeController = nullptr;
+#include <algorithm>
+#include <atomic>
+#include <cstring>
+
+#include "nvs_flash.h"
 
 // Nintendo HID descriptor and replies
 static uint8_t hid_descriptor[] = {0x05, 0x01, 0x09, 0x05, 0xa1, 0x01, 0x06, 0x01, 0xff, 0x85, 0x21, 0x09, 0x21, 0x75, 0x08, 0x95, 0x30, 0x81, 0x02, 0x85, 0x30, 0x09, 0x30, 0x75, 0x08, 0x95, 0x30, 0x81, 0x02, 0x85, 0x31, 0x09, 0x31, 0x75, 0x08, 0x96, 0x69, 0x01, 0x81, 0x02, 0x85, 0x32, 0x09, 0x32, 0x75, 0x08, 0x96,
@@ -26,119 +28,356 @@ static uint8_t reply3001[] = {0x1C, 0x8E, 0x00, 0x00, 0x00, 0x00, 0x08, 0x80, 0x
 static uint8_t r3333_l[] = {0x03, 0x8E, 0x84, 0x00, 0x12, 0x01, 0x18, 0x80, 0x01, 0x18, 0x80, 0x80, 0x80, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 static uint8_t r3333_r[] = {0x31, 0x8e, 0x00, 0x00, 0x00, 0x00, 0x08, 0x80, 0x00, 0x08, 0x80, 0x00, 0xa0, 0x21, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7b, 0x00};
 static uint8_t r3333_pro[] = {0x31, 0x8e, 0x00, 0x00, 0x00, 0x00, 0x08, 0x80, 0x00, 0x08, 0x80, 0x00, 0xa0, 0x21, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x05, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7b, 0x00};
-static uint8_t reply3401[] = {0x12, 0x8e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x80, 0x00, 0x80, 0x22, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
 
-// Timer for replies
-static uint8_t global_timer = 0;
+// Bluedroid internals (private bt headers). Every HID report makes Bluedroid's
+// power manager request sniff mode immediately (bta_hd_act.c + bta_dm_cfg.c HD
+// spec). Outside the grip menu the Switch negotiates sniff itself, the two
+// requests collide (LMP 0x23) and the Switch drops the HID channels. The PM
+// never initiates sniff when the peer's link policy lacks it (bta_dm_pm.c).
+extern "C" {
+void bta_sys_clear_policy(uint8_t id, uint8_t policy, uint8_t *peer_addr);
+uint8_t BTM_SetLinkPolicy(uint8_t *remote_bda, uint16_t *settings);
+}
+
+static constexpr uint8_t kBtaIdHd = 20;
+static constexpr uint16_t kHciEnableRoleSwitch = 0x0001;
+static constexpr uint16_t kHciEnableSniff = 0x0004;
+
+// 0: keep the link active; the controller also rejects sniff requested by the
+//    Switch. The Switch drops the HID channels ~300 ms after connecting.
+// 1: never initiate sniff locally, but accept sniff requested by the Switch.
+#ifndef SWITCH_LINK_POLICY
+#define SWITCH_LINK_POLICY 1
+#endif
+
+// Registration is asynchronous. These objects must outlive begin() because
+// Bluedroid consumes their pointers later from its own task.
+static esp_hidd_app_param_t hid_app_param = {};
+static esp_hidd_qos_param_t hid_qos = {};
+
+// Shared between the Arduino loop and the Bluetooth callbacks.
+static portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
+static uint8_t s_buttons[3] = {0, 0, 0};
+static uint8_t s_sticks[4] = {128, 128, 128, 128};
+static esp_bd_addr_t s_hostAddress = {};
+static bool s_hostKnown = false;
+static SwitchLinkStats s_stats = {};
+
+static std::atomic<uint8_t> s_timer{0};
+static std::atomic<bool> s_connected{false};
+static std::atomic<bool> s_connecting{false};
+static std::atomic<bool> s_handshakeComplete{false};
+static std::atomic<uint32_t> s_pendingEvents{0};
+
+enum PendingEvent : uint32_t {
+    EVT_OPEN = 1 << 0,
+    EVT_CLOSE = 1 << 1,
+    EVT_CONNECTING = 1 << 2,
+    EVT_OPEN_FAILED = 1 << 3,
+    EVT_HANDSHAKE = 1 << 4,
+    EVT_POLICY = 1 << 5,
+};
+
+static void postEvent(uint32_t event) {
+    s_pendingEvents.fetch_or(event);
+}
+
+static void rememberHost(const uint8_t *address) {
+    portENTER_CRITICAL(&s_mux);
+    memcpy(s_hostAddress, address, sizeof(s_hostAddress));
+    s_hostKnown = true;
+    portEXIT_CRITICAL(&s_mux);
+}
+
+static void applyLinkPolicy(uint8_t *address) {
+    // Runs in the BTC task: one uint16 update in the BTA peer record plus a
+    // queued HCI Write Link Policy command.
+    bta_sys_clear_policy(kBtaIdHd, kHciEnableSniff, address);
+#if SWITCH_LINK_POLICY == 1
+    uint16_t settings = kHciEnableRoleSwitch | kHciEnableSniff;
+    BTM_SetLinkPolicy(address, &settings);
+#else
+    (void)kHciEnableRoleSwitch;
+#endif
+    portENTER_CRITICAL(&s_mux);
+    ++s_stats.policyApplied;
+    portEXIT_CRITICAL(&s_mux);
+    postEvent(EVT_POLICY);
+}
+
+static uint16_t expandStickTo12Bits(uint8_t value) {
+    // Keep Android's neutral value (128) exactly at the calibrated Switch
+    // center (0x800), while still reaching both 12-bit endpoints.
+    if (value <= 128) {
+        return static_cast<uint16_t>(value) << 4;
+    }
+
+    return 0x800U +
+           ((static_cast<uint32_t>(value - 128) * 0x7FFU + 63U) / 127U);
+}
+
+static void packStick(uint8_t *target, uint8_t x, uint8_t y) {
+    const uint16_t x12 = expandStickTo12Bits(x);
+    const uint16_t y12 = expandStickTo12Bits(y);
+
+    target[0] = static_cast<uint8_t>(x12);
+    target[1] = static_cast<uint8_t>(((x12 >> 8) & 0x0F) |
+                                     ((y12 & 0x0F) << 4));
+    target[2] = static_cast<uint8_t>(y12 >> 4);
+}
+
+// Fills timer, buttons and sticks (bytes 0 and 2..10) with the live state so
+// every report the Switch receives agrees with the latest input.
+static void fillInputState(uint8_t *report) {
+    report[0] = s_timer.fetch_add(1);
+    portENTER_CRITICAL(&s_mux);
+    const uint8_t b0 = s_buttons[0], b1 = s_buttons[1], b2 = s_buttons[2];
+    const uint8_t lx = s_sticks[0], ly = s_sticks[1];
+    const uint8_t rx = s_sticks[2], ry = s_sticks[3];
+    portEXIT_CRITICAL(&s_mux);
+    report[2] = b0; report[3] = b1; report[4] = b2;
+    packStick(&report[5], lx, ly);
+    packStick(&report[8], rx, ry);
+}
+
+static esp_err_t sendSubcommandReply(const uint8_t *tpl, size_t len) {
+    uint8_t reply[64];
+    if (len > sizeof(reply)) return ESP_ERR_INVALID_SIZE;
+    memcpy(reply, tpl, len);
+    fillInputState(reply);
+    return esp_bt_hid_device_send_report(
+        ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, len, reply);
+}
+
+// Plain ACK (0x80 + subcommand id) for subcommands without payload, such as
+// HOME light (0x38) or MCU state (0x22). Unanswered ones get retried.
+static esp_err_t sendSubcommandAck(uint8_t subcommand) {
+    uint8_t reply[48] = {0};
+    reply[1] = 0x8E;
+    reply[12] = 0x80;
+    reply[13] = subcommand;
+    return sendSubcommandReply(reply, sizeof(reply));
+}
 
 // Default values
-bool SwitchController::_connected = false;
 ControllerType SwitchController::_activeType = CT_PRO_CONTROLLER;
-bool SwitchController::_handshake_complete = false;
 
 SwitchController::SwitchController() {}
+
+void SwitchController::gap_cb(esp_bt_gap_cb_event_t event, esp_bt_gap_cb_param_t *param) {
+    if (event != ESP_BT_GAP_MODE_CHG_EVT) return;
+    portENTER_CRITICAL(&s_mux);
+    ++s_stats.pmModeChanges;
+    s_stats.lastPmMode = param->mode_chg.mode;
+    portEXIT_CRITICAL(&s_mux);
+}
 
 // Callback handler
 void SwitchController::hid_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *param) {
     switch (event) {
+        case ESP_HIDD_INIT_EVT: {
+            if (param->init.status != ESP_HIDD_SUCCESS) {
+                Serial.printf("HID Device init failed: status=%d\n",
+                              param->init.status);
+                break;
+            }
+
+            esp_err_t err = esp_bt_hid_device_register_app(
+                &hid_app_param, &hid_qos, &hid_qos);
+            if (err != ESP_OK) {
+                Serial.printf("Could not register HID Device app: %s\n",
+                              esp_err_to_name(err));
+            }
+            break;
+        }
         // Check for known devices after BT setup is ready
         case ESP_HIDD_REGISTER_APP_EVT: {
-            Serial.println("App registered! Checking for known devices...");
-            int count = esp_bt_gap_get_bond_device_num();
-            if (count > 0) {
-                Serial.printf("Known device found: %d. Attempting reconnection...\n", count);
-                esp_bd_addr_t *addr_list = (esp_bd_addr_t *)malloc(sizeof(esp_bd_addr_t) * count);
-                if (addr_list) {
-                    esp_bt_gap_get_bond_device_list(&count, addr_list);
-                    esp_err_t err = esp_bt_hid_device_connect(addr_list[0]);
-                    if (err == ESP_OK) {
-                        Serial.println("Request sent.");
-                    } else {
-                        Serial.printf("Connection failed: %s\n", esp_err_to_name(err));
-                    }
-                    free(addr_list);
+            if (param->register_app.status != ESP_HIDD_SUCCESS) {
+                Serial.printf("HID Device registration failed: status=%d\n",
+                              param->register_app.status);
+                break;
+            }
+
+            // Bluedroid keeps the HID virtual-cable host independently from the
+            // generic bond list. This is the Switch address; using bond[0] is no
+            // longer safe because the DS4 is bonded too.
+            if (param->register_app.in_use) {
+                const uint8_t *address = param->register_app.bd_addr;
+                Serial.printf(
+                    "Reconnecting HID Device to Switch [%02X:%02X:%02X:%02X:%02X:%02X]...\n",
+                    address[0], address[1], address[2],
+                    address[3], address[4], address[5]);
+                rememberHost(address);
+                esp_err_t err = esp_bt_hid_device_connect(param->register_app.bd_addr);
+                if (err == ESP_OK) {
+                    s_connecting = true;
+                } else {
+                    Serial.printf("Could not request connection to Switch: %s\n",
+                                  esp_err_to_name(err));
                 }
             } else {
-                Serial.println("No known devices. Waiting for pairing...");
+                int count = esp_bt_gap_get_bond_device_num();
+                esp_bd_addr_t *addresses = count > 0
+                    ? static_cast<esp_bd_addr_t *>(malloc(sizeof(esp_bd_addr_t) * count))
+                    : nullptr;
+
+                if (addresses != nullptr &&
+                    esp_bt_gap_get_bond_device_list(&count, addresses) == ESP_OK) {
+                    const uint8_t *address = addresses[0];
+                    Serial.printf(
+                        "No virtual cable; trying bonded host [%02X:%02X:%02X:%02X:%02X:%02X]...\n",
+                        address[0], address[1], address[2],
+                        address[3], address[4], address[5]);
+                    esp_err_t err = esp_bt_hid_device_connect(addresses[0]);
+                    if (err != ESP_OK) {
+                        Serial.printf("Could not request HID Device connection: %s\n",
+                                      esp_err_to_name(err));
+                    }
+                } else {
+                    Serial.println("Switch not bonded; waiting for pairing...");
+                    esp_bt_gap_set_scan_mode(
+                        ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+                }
+                free(addresses);
             }
             break;
         }
         // Connected event
-        case ESP_HIDD_OPEN_EVT:
-            _connected = true;
-            Serial.println("Switch verbunden!");
-            if (activeController) {
-                activeController->sendReport();
+        case ESP_HIDD_OPEN_EVT: {
+            s_handshakeComplete = false;
+            const bool connected = param->open.status == ESP_HIDD_SUCCESS &&
+                param->open.conn_status == ESP_HIDD_CONN_STATE_CONNECTED;
+
+            if (connected) {
+                // Before any reply is sent: stop the local PM from forcing sniff.
+                applyLinkPolicy(param->open.bd_addr);
+                rememberHost(param->open.bd_addr);
+                s_connecting = false;
+                s_connected = true;
+                postEvent(EVT_OPEN);
+            } else if (param->open.status == ESP_HIDD_SUCCESS &&
+                       param->open.conn_status == ESP_HIDD_CONN_STATE_CONNECTING) {
+                s_connecting = true;
+                postEvent(EVT_CONNECTING);
+            } else {
+                s_connected = false;
+                s_connecting = false;
+                postEvent(EVT_OPEN_FAILED);
             }
-            _handshake_complete = true;
             break;
+        }
         // Disconnected event
         case ESP_HIDD_CLOSE_EVT:
-            _connected = false;
-            Serial.println("Switch getrennt!");
+            s_connected = false;
+            s_connecting = false;
+            s_handshakeComplete = false;
+            postEvent(EVT_CLOSE);
             esp_bt_gap_set_scan_mode(ESP_BT_CONNECTABLE, ESP_BT_GENERAL_DISCOVERABLE);
+            break;
+        case ESP_HIDD_SEND_REPORT_EVT:
+            if (param->send_report.status != ESP_HIDD_SUCCESS) {
+                portENTER_CRITICAL(&s_mux);
+                ++s_stats.reportTxFailures;
+                portEXIT_CRITICAL(&s_mux);
+            }
             break;
         // Replying to switch requests
         case ESP_HIDD_INTR_DATA_EVT: {
-            uint8_t* p = param->intr_data.data;
+            if (!s_connected || param->intr_data.data == nullptr) {
+                break;
+            }
+
+            // OUTPUT 0x10 contains only the packet counter and eight rumble
+            // bytes. The Switch sends it continuously during normal use; it
+            // has no subcommand to answer and must not generate serial traffic
+            // from inside the Bluetooth callback.
+            if (param->intr_data.report_id == 0x10) {
+                break;
+            }
+
+            // Normal subcommands arrive in OUTPUT 0x01. Its payload needs the
+            // packet counter, eight rumble bytes and the subcommand byte.
+            if (param->intr_data.report_id != 0x01 ||
+                param->intr_data.len < 10) {
+                break;
+            }
+
+            const uint8_t* p = param->intr_data.data;
+            const uint16_t len = param->intr_data.len;
             // Byte 9 for request ID
-            int cmd_idx = 9;
-            if (p[cmd_idx] == 0x02) {
-                reply02[0] = global_timer++;
-                esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply02), reply02);
-            } else if (p[cmd_idx] == 0x08) {
-                esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply08), reply08);
-            } else if (p[cmd_idx] == 0x03) {
-                esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply03), reply03);
-            } else if (p[cmd_idx] == 0x04) {
-                esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply04), reply04);
+            const uint8_t subcommand = p[9];
+            portENTER_CRITICAL(&s_mux);
+            ++s_stats.subcommands;
+            portEXIT_CRITICAL(&s_mux);
+
+            bool handled = true;
+            if (subcommand == 0x02) {
+                sendSubcommandReply(reply02, sizeof(reply02));
+            } else if (subcommand == 0x08) {
+                sendSubcommandReply(reply08, sizeof(reply08));
+            } else if (subcommand == 0x03) {
+                esp_err_t err = sendSubcommandReply(reply03, sizeof(reply03));
+
+                // Subcommand 0x03 selects the input report mode. Only start
+                // periodic 0x30 reports after the Switch explicitly requests it.
+                if (err == ESP_OK && len >= 11 && p[10] == 0x30) {
+                    s_handshakeComplete = true;
+                    postEvent(EVT_HANDSHAKE);
+                }
+            } else if (subcommand == 0x04) {
+                sendSubcommandReply(reply04, sizeof(reply04));
             }
             // SPI requests
-            else if (p[cmd_idx] == 0x10) {
+            else if (subcommand == 0x10 && len >= 12) {
                 if (p[10] == 0x00 && p[11] == 0x60) {
-                    esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(spi_reply_address_0), spi_reply_address_0);
+                    sendSubcommandReply(spi_reply_address_0, sizeof(spi_reply_address_0));
                 } else if (p[10] == 0x50 && p[11] == 0x60) {
-                    esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(spi_reply_address_0x50), spi_reply_address_0x50);
+                    sendSubcommandReply(spi_reply_address_0x50, sizeof(spi_reply_address_0x50));
                 } else if (p[10] == 0x80 && p[11] == 0x60) {
-                    esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(spi_reply_address_0x80), spi_reply_address_0x80);
+                    sendSubcommandReply(spi_reply_address_0x80, sizeof(spi_reply_address_0x80));
                 } else if (p[10] == 0x98 && p[11] == 0x60) {
-                    esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(spi_reply_address_0x98), spi_reply_address_0x98);
+                    sendSubcommandReply(spi_reply_address_0x98, sizeof(spi_reply_address_0x98));
                 } else if (p[10] == 0x10 && p[11] == 0x80) {
-                    esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(spi_reply_address_0x10), spi_reply_address_0x10);
+                    sendSubcommandReply(spi_reply_address_0x10, sizeof(spi_reply_address_0x10));
                 } else if (p[10] == 0x3D && p[11] == 0x60) {
-                    esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(spi_reply_address_0x3d), spi_reply_address_0x3d);
+                    sendSubcommandReply(spi_reply_address_0x3d, sizeof(spi_reply_address_0x3d));
                 } else if (p[10] == 0x20 && p[11] == 0x60) {
-                    esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(spi_reply_address_0x20), spi_reply_address_0x20);
+                    sendSubcommandReply(spi_reply_address_0x20, sizeof(spi_reply_address_0x20));
+                } else {
+                    // An SPI read needs its data; an empty ACK would be wrong.
+                    handled = false;
                 }
-            } 
+            }
             // IMU and sensors
-            else if (p[cmd_idx] == 0x40) {
-                esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply4001), reply4001);
-            } else if (p[cmd_idx] == 0x48) {
-                esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply4801), reply4801);
-            } else if (p[cmd_idx] == 0x34) {
-                esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply3401), reply3401);
-            } else if (p[cmd_idx] == 0x30) {
-                esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, sizeof(reply3001), reply3001);
-            } else if (p[cmd_idx] == 0x21 && p[10] == 0x21) {
-                uint8_t* targetReply;
-                size_t replySize;
-
+            else if (subcommand == 0x40) {
+                sendSubcommandReply(reply4001, sizeof(reply4001));
+            } else if (subcommand == 0x48) {
+                sendSubcommandReply(reply4801, sizeof(reply4801));
+            } else if (subcommand == 0x30) {
+                sendSubcommandReply(reply3001, sizeof(reply3001));
+            } else if (subcommand == 0x21 && len >= 11 && p[10] == 0x21) {
                 switch (_activeType) {
-                    case CT_JOYCON_L: 
-                        targetReply = r3333_l; 
-                        replySize = sizeof(r3333_l); 
+                    case CT_JOYCON_L:
+                        sendSubcommandReply(r3333_l, sizeof(r3333_l));
                         break;
-                    case CT_JOYCON_R: 
-                        targetReply = r3333_r; 
-                        replySize = sizeof(r3333_r); 
+                    case CT_JOYCON_R:
+                        sendSubcommandReply(r3333_r, sizeof(r3333_r));
                         break;
-                    default: 
-                        targetReply = r3333_pro; 
-                        replySize = sizeof(r3333_pro);
+                    default:
+                        sendSubcommandReply(r3333_pro, sizeof(r3333_pro));
                         break;
                 }
-                esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x21, replySize, targetReply);
+            } else {
+                // 0x34, 0x38 (HOME light), 0x22 (MCU state), 0x01, 0x06, ...
+                sendSubcommandAck(subcommand);
+                handled = false;
+            }
+
+            if (!handled) {
+                portENTER_CRITICAL(&s_mux);
+                ++s_stats.unknownSubcommands;
+                s_stats.lastUnknownSubcommand = subcommand;
+                portEXIT_CRITICAL(&s_mux);
             }
             break;
         }
@@ -148,7 +387,6 @@ void SwitchController::hid_cb(esp_hidd_cb_event_t event, esp_hidd_cb_param_t *pa
 }
 
 bool SwitchController::begin(ControllerType type) {
-    activeController = this;
     _activeType = type;
 
     uint8_t bt_mac[6];
@@ -209,6 +447,12 @@ bool SwitchController::begin(ControllerType type) {
 
     delay(100);
 
+    ret = esp_bt_gap_register_callback(gap_cb);
+    if (ret != ESP_OK) {
+        Serial.printf("GAP callback registration failed: %s\n",
+                      esp_err_to_name(ret));
+    }
+
     /*  CoD definition
         cod.service might vary with other controller types! */
     esp_bt_cod_t cod;
@@ -228,22 +472,27 @@ bool SwitchController::begin(ControllerType type) {
     else device_name = "Pro Controller";
 
     // BT app parameters
-    esp_hidd_app_param_t app_param = {
-        .name = device_name,
-        .description = "Gamepad",
-        .provider = "Nintendo",
-        .subclass = 0x08,
-        .desc_list = hid_descriptor,
-        .desc_list_len = sizeof(hid_descriptor)
-    };
-
-    esp_hidd_qos_param_t qos = {0};
+    hid_app_param.name = device_name;
+    hid_app_param.description = "Gamepad";
+    hid_app_param.provider = "Nintendo";
+    hid_app_param.subclass = 0x08;
+    hid_app_param.desc_list = hid_descriptor;
+    hid_app_param.desc_list_len = sizeof(hid_descriptor);
     
     // HID register logic
-    esp_bt_hid_device_register_callback(hid_cb);
-    esp_bt_hid_device_init();
-    delay(100);
-    esp_bt_hid_device_register_app(&app_param, &qos, &qos);
+    ret = esp_bt_hid_device_register_callback(hid_cb);
+    if (ret != ESP_OK) {
+        Serial.printf("HID callback registration failed: %s\n",
+                      esp_err_to_name(ret));
+        return false;
+    }
+
+    ret = esp_bt_hid_device_init();
+    if (ret != ESP_OK) {
+        Serial.printf("HID Device init request failed: %s\n",
+                      esp_err_to_name(ret));
+        return false;
+    }
     
     // BT active
     esp_bt_dev_set_device_name(device_name);
@@ -252,18 +501,89 @@ bool SwitchController::begin(ControllerType type) {
     return true;
 }
 
+void SwitchController::service(uint32_t now) {
+    static constexpr uint32_t kFirstRetryMs = 1000;
+    static constexpr uint32_t kMaxRetryMs = 15000;
+    static constexpr uint32_t kConnectTimeoutMs = 10000;
+
+    const uint32_t events = s_pendingEvents.exchange(0);
+    if (events & EVT_CONNECTING) Serial.println("Switch HID connecting...");
+    if (events & EVT_OPEN) {
+        Serial.println("Switch HID connected; waiting for handshake...");
+    }
+    if (events & EVT_POLICY) {
+        Serial.printf("Link policy applied: %s\n",
+                      SWITCH_LINK_POLICY == 1
+                          ? "no local sniff, accept sniff from Switch"
+                          : "link active (no sniff)");
+    }
+    if (events & EVT_HANDSHAKE) {
+        Serial.println("Handshake complete; report mode 0x30 active.");
+        // Only a completed handshake proves the link is healthy; resetting on
+        // OPEN would retry every second when the Switch keeps dropping us.
+        _reconnectDelayMs = 0;
+    }
+    if (events & (EVT_CLOSE | EVT_OPEN_FAILED)) {
+        Serial.println(events & EVT_CLOSE ? "Switch HID disconnected."
+                                          : "Failed to open HID.");
+        if (_reconnectDelayMs == 0) _reconnectDelayMs = kFirstRetryMs;
+        _lastReconnectMs = now;
+    }
+
+    if (s_connected) return;
+    if (s_connecting) {
+        // Bluedroid normally reports the outcome; don't wait forever for it.
+        if (_reconnectDelayMs == 0 || now - _lastReconnectMs < kConnectTimeoutMs) return;
+        s_connecting = false;
+    }
+    if (_reconnectDelayMs == 0 || now - _lastReconnectMs < _reconnectDelayMs) return;
+
+    esp_bd_addr_t address;
+    portENTER_CRITICAL(&s_mux);
+    const bool known = s_hostKnown;
+    memcpy(address, s_hostAddress, sizeof(address));
+    portEXIT_CRITICAL(&s_mux);
+    if (!known) return;
+
+    _lastReconnectMs = now;
+    _reconnectDelayMs = std::min(_reconnectDelayMs * 2, kMaxRetryMs);
+    portENTER_CRITICAL(&s_mux);
+    ++s_stats.reconnectAttempts;
+    portEXIT_CRITICAL(&s_mux);
+
+    Serial.println("Retrying connection to Switch...");
+    if (esp_bt_hid_device_connect(address) == ESP_OK) {
+        s_connecting = true;
+    }
+}
+
+SwitchLinkStats SwitchController::stats() {
+    portENTER_CRITICAL(&s_mux);
+    const SwitchLinkStats copy = s_stats;
+    portEXIT_CRITICAL(&s_mux);
+    return copy;
+}
+
 // Sending current controller state
 void SwitchController::sendReport() {
-    if (!_connected) return;
+    if (!s_connected) return;
     uint8_t rep[48] = {0};
-    rep[0] = _timer++; rep[1] = 0x8E;
-    rep[2] = _b[0]; rep[3] = _b[1]; rep[4] = _b[2];
-    rep[5] = (_s[0] << 4) & 0xF0; rep[6] = (_s[0] & 0xF0) >> 4; rep[7] = _s[1];
-    rep[8] = (_s[2] << 4) & 0xF0; rep[9] = (_s[2] & 0xF0) >> 4; rep[10] = _s[3];
+    rep[1] = 0x8E;
+    fillInputState(rep);
     esp_bt_hid_device_send_report(ESP_HIDD_REPORT_TYPE_INTRDATA, 0x30, sizeof(rep), rep);
 }
 
-bool SwitchController::isConnected() { return _connected; }
-bool SwitchController::isHandshakeComplete() { return _handshake_complete; }
-void SwitchController::setButtons(uint8_t b1, uint8_t b2, uint8_t b3) { _b[0]=b1; _b[1]=b2; _b[2]=b3; }
-void SwitchController::setSticks(uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry) { _s[0]=lx; _s[1]=ly; _s[2]=rx; _s[3]=ry; }
+bool SwitchController::isConnected() { return s_connected; }
+bool SwitchController::isHandshakeComplete() { return s_handshakeComplete; }
+
+void SwitchController::setButtons(uint8_t b1, uint8_t b2, uint8_t b3) {
+    portENTER_CRITICAL(&s_mux);
+    s_buttons[0] = b1; s_buttons[1] = b2; s_buttons[2] = b3;
+    portEXIT_CRITICAL(&s_mux);
+}
+
+void SwitchController::setSticks(uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry) {
+    portENTER_CRITICAL(&s_mux);
+    s_sticks[0] = lx; s_sticks[1] = ly; s_sticks[2] = rx; s_sticks[3] = ry;
+    portEXIT_CRITICAL(&s_mux);
+}
