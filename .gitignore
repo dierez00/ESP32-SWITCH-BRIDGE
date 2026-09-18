@@ -3,4 +3,6 @@
 .DS_Store
 .idea
 *.log
-test
+# Local agent/code intelligence state
+/.atl/
+/.codegraph/

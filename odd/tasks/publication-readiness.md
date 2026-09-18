@@ -12,7 +12,7 @@ Artifacts remain English, matching existing documentation. Recommend retaining t
 
 ## Tasks
 - [x] P1: Document upstream credit, adaptation changes, VS Code PlatformIO setup, usage and publication checklist. Check source/config references, local Markdown links and `git diff --check`.
-- [ ] P2: Exclude local tooling and stop ignoring Android tests. Check ignore behavior and run the existing firmware build; report Android verification availability honestly. Do not stage pre-existing ignored/untracked test sources.
+- [x] P2: Exclude local tooling and stop ignoring Android tests. Check ignore behavior and run the existing firmware build; report Android verification availability honestly. Do not stage pre-existing ignored/untracked test sources.
 
 ## Acceptance criteria
 - Original creator and repository are credited prominently; adaptation maintainer is identified without claiming original authorship.
@@ -31,14 +31,20 @@ Artifacts remain English, matching existing documentation. Recommend retaining t
 - Every completed task has a Conventional Commit; no AI attribution.
 
 ## Progress
-P1 documentation complete. Local upstream baseline: `d7e062e`; adaptation commit: `e7f2af3`. Next: P2 hygiene and builds.
+P1 and P2 complete locally. Next: review/include the seven pre-existing Android test files, install the required Android environment, rerun Android checks and test physical hardware before publication. No remote operation was performed.
 
 ## Evidence
 - P1: `git diff --check` passed; Python/std lib checked 13 local Markdown file links across four documents (passed).
 - P1: Source/config references checked against the firmware constants, PlatformIO/Gradle configuration and retained history. Physical runtime harness: N/A for documentation; hardware verification remains pending.
-- P1 commit identity: pending creation; recorded by the next work unit to avoid a self-referential hash.
+- P1 commit: `e762b289f84e2610af16d8b490d3deaa0ee7d400` (`docs: prepare attributed PlatformIO publication guides`).
 - P1 rollback: README guides, CREDITS.md and docs/PUBLISHING.md only; no firmware or Android behavior changed.
-- Builds and ignore checks pending P2.
+- P2: `git check-ignore` assertions passed for .pio, .vscode, .atl, .codegraph and Android local.properties; all seven pre-existing Android test sources became visible/unignored and remain untouched/uncommitted.
+- P2: `pio run -e esp32dev` passed (5.03 s), Espressif32 7.0.1, ESP-IDF 4.4.7. RAM 60,944/327,680 bytes (18.6%); flash 1,370,265/3,866,624 bytes (35.4%). Existing mixed-framework warning: Arduino component uses default esp32 variant.
+- P2: `./gradlew testDebugUnitTest lintDebug assembleDebug` skipped: Java unavailable on PATH. No installation/environment change attempted; Android tests, lint and APK build are not verified.
+- P2: `git diff --check` passed. LICENSE, firmware/PlatformIO behavior and tracked sdkconfig bytes unchanged after build. Physical runtime harness: N/A for ignore changes; firmware upload and physical device checks remain pending.
+- P2 work-unit commit: `chore: keep local tooling private and expose Android tests`; resolve its exact identity with `git log -1 --format=%H -- .gitignore` (avoids a self-referential hash).
+- P2 rollback: root .gitignore tooling exclusions and removal of the broad test rule; existing test sources are not part of this commit.
+- Publication scope authored changes: 203 additions+deletions against e7f2af3 (before P2 commit); delivery threshold not reached. RDD disabled/unmanaged; ordinary functional checks above apply.
 
 ## Rollback
 Revert publication documentation and ignore changes independently of the existing Android/UDP implementation.
