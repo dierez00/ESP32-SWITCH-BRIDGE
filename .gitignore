@@ -6,3 +6,5 @@
 # Local agent/code intelligence state
 /.atl/
 /.codegraph/
+.atl
+.codegraph
