@@ -36,7 +36,17 @@ While the bridge is active, a foreground service (persistent notification with a
 
 ## Building
 
+Open **this `android-app/` directory** in Android Studio, not the firmware root.
+Install/configure JDK 17 and the Android SDK, then let Gradle sync. Set the SDK
+location through Android Studio or an untracked `local.properties` file. The
+Gradle wrapper is included; use it rather than installing a different Gradle.
+The versions below describe the repository configuration, not a verified build
+on every host. Dependency downloads require Internet before joining the ESP32 AP.
+
+
 The project uses JDK 17, Gradle 9.6.0, Android Gradle Plugin 9.4.0, SDK 37, Build Tools 36.0.0, Kotlin/Compose Compiler 2.2.10 and Compose BOM 2026.08.00.
+
+Run from `android-app/` (Windows: use `gradlew.bat`):
 
 ```bash
 ./gradlew testDebugUnitTest
@@ -47,6 +57,15 @@ The project uses JDK 17, Gradle 9.6.0, Android Gradle Plugin 9.4.0, SDK 37, Buil
 The debug APK is generated at:
 
 `app/build/outputs/apk/debug/app-debug.apk`
+
+Transfer it to your own phone and allow installation from that source, or run
+it from Android Studio with USB debugging enabled. This is a development APK,
+not a signed production release. Do not commit signing keys or SDK paths.
+A successful build does not prove Switch pairing or input focus behavior;
+verify both on physical devices.
+
+See [CREDITS.md](../CREDITS.md) for the original firmware credit and adaptation
+provenance. Distribution of an APK must include access to its corresponding source.
 
 ## Protocol
 

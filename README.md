@@ -5,6 +5,12 @@ Bluetooth Classic and forwards input received over Wi-Fi/UDP. Together with the
 companion Android app in [`android-app/`](android-app/), it lets you play on a
 Switch with a DualShock 4 (or any gamepad Android recognizes).
 
+> **Origin and credit:** This is dierez00's adaptation of
+> [ghostside-net/ESP32-Switch-Controller-Joycon](https://github.com/ghostside-net/ESP32-Switch-Controller-Joycon).
+> The original ESP32 controller foundation is credited to its creator; the Android/UDP
+> bridge is the adaptation maintained here. See [CREDITS.md](CREDITS.md) for provenance
+> and [the publication guide](docs/PUBLISHING.md) before sharing a copy.
+
 ```text
 DualShock 4 -> Android app -> Wi-Fi/UDP -> ESP32 -> Bluetooth Classic -> Switch
 ```
@@ -33,8 +39,9 @@ DualShock 4 -> Android app -> Wi-Fi/UDP -> ESP32 -> Bluetooth Classic -> Switch
 
 ## 🛠️ Hardware Requirements
 
-- **Tested Board:** ESP32 DevKit v1 / ESP32-D0WD-V3 (any classic ESP-WROOM-32 board
-  should work). ESP32-S2/S3/C3 are **not** supported: they lack Bluetooth Classic.
+- **Target Board:** Classic ESP32 DevKit / ESP-WROOM-32 with 4 MB flash and
+  Bluetooth Classic. ESP32-S2/S3/C3 are **not** supported by this firmware.
+  Hardware pairing, controller mappings and latency must be verified on your devices.
 - **Console:** Nintendo Switch / Nintendo Switch Lite / Nintendo Switch OLED.
 - **Phone:** Android 10 or later (`minSdk 29`) with a paired DualShock 4.
 
@@ -45,15 +52,49 @@ DualShock 4 -> Android app -> Wi-Fi/UDP -> ESP32 -> Bluetooth Classic -> Switch
 The project is built with **PlatformIO** (VS Code extension or CLI). All required
 configuration is bundled in the repository.
 
-1. Clone this repository and open it with PlatformIO.
-2. Connect your ESP32 via USB.
-3. Build, flash and open the serial monitor:
+### VS Code + PlatformIO (recommended)
+
+1. Install VS Code and the **PlatformIO IDE** extension, then restart VS Code.
+2. Clone or download this repository. In VS Code choose **File > Open Folder**
+   and select the repository root containing `platformio.ini`. Do **not** create
+   a New Project or open `android-app/` as the firmware project.
+3. Wait for PlatformIO to finish loading the project and its dependencies.
+   In **PlatformIO > Project Tasks > esp32dev > General**, select **Build**.
+4. Connect the ESP32 with a USB **data** cable. Select **Upload**, then **Monitor**
+   (115200 baud). Uploading replaces the firmware already on the board.
+5. Confirm the monitor reports the access point, then follow the pairing steps below.
+
+### PlatformIO CLI
+
+Use the VS Code PlatformIO terminal, or a shell with `pio` installed. Run these
+commands from the repository root; replace the serial-port placeholder:
+
 
 ```bash
 pio run -e esp32dev
 pio run -e esp32dev -t upload --upload-port <your-serial-port>
 pio device monitor --port <your-serial-port> --baud 115200
 ```
+
+To list serial ports, run `pio device list`. If automatic selection chooses the
+wrong board, supply `--upload-port` as above and select the same port for monitoring.
+
+`platformio.ini` uses Arduino **and** ESP-IDF, the `esp32dev` environment, 4 MB
+flash and `huge_app.csv` partitions. Keep `sdkconfig.defaults` and
+`sdkconfig.esp32dev`; this is not a generic Arduino-only project. The
+`espressif32` platform is currently unpinned, so a fresh dependency resolution
+may differ from an existing setup. Record your PlatformIO/platform versions
+when reporting a reproducible build instead of assuming all versions work.
+
+### Upload and monitor troubleshooting
+
+- **No serial device:** Try a known data cable and another USB port; check the
+  USB-to-serial driver for your board and serial-device permissions on your OS.
+- **Upload stuck connecting:** Hold **BOOT** while upload starts, release after
+  connection, and retry. Close other programs using the serial port.
+- **Unreadable/no logs:** Confirm the correct port and **115200** baud; reset the board.
+- **Build fails:** Preserve the error and tool versions. Do not replace the
+  bundled ESP-IDF configuration with a New Project template to hide the failure.
 
 Optional build flag: `-D SWITCH_COEX_PREFER_BT=1` makes the Wi-Fi/Bluetooth
 coexistence scheduler prefer Bluetooth.
@@ -152,4 +193,7 @@ packet starts a new sequence.
 
 ## 📄 License
 
-This project is licensed under the GNU GPL v3.0 License. See the LICENSE file for more details.
+This adaptation retains the upstream GNU GPL v3.0 license. See [LICENSE](LICENSE)
+and [CREDITS.md](CREDITS.md). Redistributing the firmware or APK requires
+complying with the license, including providing the corresponding source.
+This project is not affiliated with Nintendo or Sony.
